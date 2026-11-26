@@ -82,11 +82,15 @@ class Honor600CameraSessionManager(
     private var activeCameraId: String? = null
 
     private var controlState = ManualControlState()
-    private var previewSize = Size(1920, 1080)
+    private var previewSize = Size(1280, 720)
     private var photoSize = Size(1920, 1080)
     private var pendingPhotoCallback: ((SavedMediaResult?) -> Unit)? = null
     private var pendingPhotoModeTag: String = "PHOTO"
+    private var sessionGeneration = 0L
+    private var isCameraOpeningOrOpen = false
+    private var isClosedByLifecycle = false
 
+    @Synchronized
     fun startThread() {
         if (cameraThread != null) return
         cameraThread = HandlerThread("Honor600Camera2Thread").apply { start() }
@@ -94,12 +98,26 @@ class Honor600CameraSessionManager(
     }
 
     @SuppressLint("MissingPermission")
-    fun openCamera(cameraId: String, desiredPreviewSize: Size, initialControls: ManualControlState) {
+    fun openCamera(
+        cameraId: String,
+        desiredPreviewSize: Size,
+        initialControls: ManualControlState,
+        forceReopen: Boolean = false
+    ) {
         startThread()
         controlState = initialControls
         cameraHandler?.post {
+            if (!forceReopen && isCameraOpeningOrOpen && activeCameraId == cameraId && !isClosedByLifecycle) {
+                // Already open or opening this exact camera; just refresh parameters if session exists
+                applyRepeatingRequestInternal()
+                return@post
+            }
             closeCameraInternal()
+            isClosedByLifecycle = false
+            isCameraOpeningOrOpen = true
             activeCameraId = cameraId
+            val myGeneration = ++sessionGeneration
+
             try {
                 val chars = cameraManager.getCameraCharacteristics(cameraId)
                 currentCharacteristics = chars
@@ -107,7 +125,7 @@ class Honor600CameraSessionManager(
                 val availPreview = map?.getOutputSizes(android.graphics.SurfaceTexture::class.java)?.toList().orEmpty()
                 previewSize = chooseBestSize(availPreview, desiredPreviewSize.width, desiredPreviewSize.height)
                 val availPhoto = map?.getOutputSizes(ImageFormat.JPEG)?.toList().orEmpty()
-                photoSize = availPhoto.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: previewSize
+                photoSize = chooseSafePhotoSize(availPhoto, previewSize)
 
                 renderer.setCameraBufferSize(previewSize.width, previewSize.height)
 
@@ -138,26 +156,42 @@ class Honor600CameraSessionManager(
                     cameraId,
                     object : CameraDevice.StateCallback() {
                         override fun onOpened(camera: CameraDevice) {
+                            if (myGeneration != sessionGeneration || isClosedByLifecycle) {
+                                runCatching { camera.close() }
+                                return
+                            }
                             cameraDevice = camera
-                            createCaptureSessionInternal()
+                            createCaptureSessionInternal(myGeneration, includeStillReader = true)
                         }
 
                         override fun onDisconnected(camera: CameraDevice) {
-                            camera.close()
-                            if (cameraDevice == camera) cameraDevice = null
+                            runCatching { camera.close() }
+                            if (cameraDevice == camera) {
+                                cameraDevice = null
+                                captureSession = null
+                                isCameraOpeningOrOpen = false
+                            }
                         }
 
                         override fun onError(camera: CameraDevice, error: Int) {
-                            camera.close()
-                            if (cameraDevice == camera) cameraDevice = null
-                            onError("Camera2 hardware error ($error) on sensor $cameraId")
+                            runCatching { camera.close() }
+                            if (cameraDevice == camera) {
+                                cameraDevice = null
+                                captureSession = null
+                                isCameraOpeningOrOpen = false
+                            }
+                            if (myGeneration == sessionGeneration && !isClosedByLifecycle) {
+                                onError("Camera2 hardware error ($error) on sensor $cameraId")
+                            }
                         }
                     },
                     cameraHandler
                 )
             } catch (se: SecurityException) {
+                isCameraOpeningOrOpen = false
                 onError("Camera permission not granted.")
             } catch (t: Throwable) {
+                isCameraOpeningOrOpen = false
                 Log.e(TAG, "Failed to open camera $cameraId", t)
                 onError("Unable to open camera $cameraId: ${t.message}")
             }
@@ -172,29 +206,17 @@ class Honor600CameraSessionManager(
     }
 
     /**
-     * Captures a still photo. When [bakeColorGrade] is true (a Log profile or 3D LUT is active),
-     * captures the OpenGL ES 3.0 graded frame cleanly; otherwise triggers full-resolution Camera2 JPEG capture.
+     * Captures a still photo. When [bakeColorGrade] is true (a Log profile or 3D LUT is active)
+     * or when the camera session is preview-only, captures the OpenGL ES 3.0 frame cleanly;
+     * otherwise triggers high-resolution Camera2 JPEG capture.
      */
     fun capturePhoto(
         bakeColorGrade: Boolean,
         modeTag: String,
         onComplete: (SavedMediaResult?) -> Unit
     ) {
-        if (bakeColorGrade) {
-            cameraHandler?.post {
-                val jpeg = renderer.captureGradedJpegSnapshot(previewSize.width, previewSize.height)
-                val saved = if (jpeg != null) {
-                    runCatching {
-                        mediaStoreRepository.saveJpegPhoto(
-                            jpegBytes = jpeg,
-                            width = previewSize.width,
-                            height = previewSize.height,
-                            modeTag = modeTag
-                        )
-                    }.getOrNull()
-                } else null
-                onComplete(saved)
-            }
+        if (bakeColorGrade || stillImageReader == null) {
+            captureFromGlPipeline(modeTag, onComplete)
             return
         }
 
@@ -202,8 +224,8 @@ class Honor600CameraSessionManager(
             val device = cameraDevice
             val session = captureSession
             val readerSurface = stillImageReader?.surface
-            if (device == null || session == null || readerSurface == null) {
-                onComplete(null)
+            if (device == null || session == null || readerSurface == null || !readerSurface.isValid) {
+                captureFromGlPipeline(modeTag, onComplete)
                 return@post
             }
             try {
@@ -216,10 +238,27 @@ class Honor600CameraSessionManager(
                 builder.set(CaptureRequest.JPEG_ORIENTATION, orientation)
                 session.capture(builder.build(), null, cameraHandler)
             } catch (t: Throwable) {
-                Log.e(TAG, "Still capture failed", t)
+                Log.w(TAG, "Hardware JPEG capture unavailable, falling back to GL snapshot", t)
                 pendingPhotoCallback = null
-                onComplete(null)
+                captureFromGlPipeline(modeTag, onComplete)
             }
+        }
+    }
+
+    private fun captureFromGlPipeline(modeTag: String, onComplete: (SavedMediaResult?) -> Unit) {
+        cameraHandler?.post {
+            val jpeg = renderer.captureGradedJpegSnapshot(previewSize.width, previewSize.height)
+            val saved = if (jpeg != null) {
+                runCatching {
+                    mediaStoreRepository.saveJpegPhoto(
+                        jpegBytes = jpeg,
+                        width = previewSize.width,
+                        height = previewSize.height,
+                        modeTag = modeTag
+                    )
+                }.getOrNull()
+            } else null
+            onComplete(saved)
         }
     }
 
@@ -250,7 +289,10 @@ class Honor600CameraSessionManager(
     }
 
     fun closeCamera() {
-        cameraHandler?.post { closeCameraInternal() }
+        cameraHandler?.post {
+            isClosedByLifecycle = true
+            closeCameraInternal()
+        }
     }
 
     fun release() {
@@ -262,6 +304,8 @@ class Honor600CameraSessionManager(
     }
 
     private fun closeCameraInternal() {
+        sessionGeneration++
+        isCameraOpeningOrOpen = false
         if (videoController.isRecording) {
             renderer.setRecordingSurface(null, 1, 1)
             videoController.stopRecording(mediaStoreRepository)
@@ -274,7 +318,8 @@ class Honor600CameraSessionManager(
         stillImageReader = null
     }
 
-    private fun createCaptureSessionInternal() {
+    private fun createCaptureSessionInternal(generation: Long, includeStillReader: Boolean) {
+        if (generation != sessionGeneration || isClosedByLifecycle) return
         val device = cameraDevice ?: return
         val previewSurface = renderer.getCameraInputSurface()
         if (previewSurface == null || !previewSurface.isValid) {
@@ -282,12 +327,17 @@ class Honor600CameraSessionManager(
             return
         }
         val targets = mutableListOf<Surface>(previewSurface)
-        stillImageReader?.surface?.let { targets.add(it) }
+        if (includeStillReader) {
+            stillImageReader?.surface?.takeIf { it.isValid }?.let { targets.add(it) }
+        } else {
+            runCatching { stillImageReader?.close() }
+            stillImageReader = null
+        }
 
         val stateCallback = object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
-                if (cameraDevice == null) {
-                    session.close()
+                if (generation != sessionGeneration || cameraDevice != device || isClosedByLifecycle) {
+                    runCatching { session.close() }
                     return
                 }
                 captureSession = session
@@ -295,7 +345,15 @@ class Honor600CameraSessionManager(
             }
 
             override fun onConfigureFailed(session: CameraCaptureSession) {
-                onError("Camera2 session configuration failed for sensor $activeCameraId")
+                runCatching { session.close() }
+                if (generation != sessionGeneration || cameraDevice != device || isClosedByLifecycle) return
+                if (includeStillReader) {
+                    // Gracefully retry with preview-only surface (photos will capture from GL pipeline)
+                    Log.w(TAG, "Dual-surface session failed; retrying preview-only session")
+                    cameraHandler?.post { createCaptureSessionInternal(generation, includeStillReader = false) }
+                } else {
+                    onError("Camera2 session configuration failed for sensor $activeCameraId")
+                }
             }
         }
 
@@ -314,8 +372,13 @@ class Honor600CameraSessionManager(
                 device.createCaptureSession(targets, stateCallback, cameraHandler)
             }
         } catch (t: Throwable) {
+            if (generation != sessionGeneration || isClosedByLifecycle) return
             Log.e(TAG, "createCaptureSession failed", t)
-            onError("Failed to create camera session: ${t.message}")
+            if (includeStillReader) {
+                cameraHandler?.post { createCaptureSessionInternal(generation, includeStillReader = false) }
+            } else {
+                onError("Failed to create camera session: ${t.message}")
+            }
         }
     }
 
@@ -326,7 +389,12 @@ class Honor600CameraSessionManager(
         if (!previewSurface.isValid) return
 
         try {
-            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+            val template = if (videoController.isRecording) {
+                CameraDevice.TEMPLATE_RECORD
+            } else {
+                CameraDevice.TEMPLATE_PREVIEW
+            }
+            val builder = device.createCaptureRequest(template)
             builder.addTarget(previewSurface)
             applyManualParameters(builder, isStillCapture = false)
             session.setRepeatingRequest(
@@ -467,7 +535,7 @@ class Honor600CameraSessionManager(
     }
 
     private fun chooseBestSize(sizes: List<Size>, targetW: Int, targetH: Int): Size {
-        if (sizes.isEmpty()) return Size(1920, 1080)
+        if (sizes.isEmpty()) return Size(1280, 720)
         // Prefer 16:9 size closest to target (capped at 1920x1080 for smooth 60 FPS GPU preview throughput)
         val cappedW = targetW.coerceAtMost(1920)
         val cappedH = targetH.coerceAtMost(1080)
@@ -475,6 +543,16 @@ class Honor600CameraSessionManager(
         return sizes.minByOrNull {
             kotlin.math.abs(it.width - cappedW) + kotlin.math.abs(it.height - cappedH)
         } ?: sizes.first()
+    }
+
+    private fun chooseSafePhotoSize(sizes: List<Size>, fallback: Size): Size {
+        if (sizes.isEmpty()) return fallback
+        // Cap simultaneous still-reader JPEG buffer at <= 12MP (4096x3072) to ensure reliable Camera2 stream configuration
+        return sizes
+            .filter { it.width <= 4096 && it.height <= 3072 }
+            .maxByOrNull { it.width.toLong() * it.height.toLong() }
+            ?: sizes.minByOrNull { it.width.toLong() * it.height.toLong() }
+            ?: fallback
     }
 
     /**

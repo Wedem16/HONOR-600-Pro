@@ -144,6 +144,7 @@ class CinemaCameraViewModel(application: Application) : AndroidViewModel(applica
     )
 
     private var rendererReady = false
+    private var discoveryStarted = false
     private var timerJob: Job? = null
     private var bannerJob: Job? = null
 
@@ -193,7 +194,7 @@ class CinemaCameraViewModel(application: Application) : AndroidViewModel(applica
                 hasAudioPermission = audioGranted
             )
         }
-        if (cameraGranted && (!wasGranted || _uiState.value.halReport == null)) {
+        if (cameraGranted && (!wasGranted || (!discoveryStarted && _uiState.value.halReport == null))) {
             discoverHardwareAndStartCamera()
         }
     }
@@ -214,9 +215,9 @@ class CinemaCameraViewModel(application: Application) : AndroidViewModel(applica
         if (!_uiState.value.hasCameraPermission) return
         val activeCam = _uiState.value.activeCamera
         if (activeCam != null && rendererReady) {
-            val size = _uiState.value.selectedVideoProfile?.actualSize ?: Size(1920, 1080)
+            val size = _uiState.value.selectedVideoProfile?.actualSize ?: Size(1280, 720)
             sessionManager.openCamera(activeCam.cameraId, size, _uiState.value.manualControls)
-        } else {
+        } else if (!discoveryStarted) {
             discoverHardwareAndStartCamera()
         }
     }
@@ -229,11 +230,14 @@ class CinemaCameraViewModel(application: Application) : AndroidViewModel(applica
     }
 
     private fun discoverHardwareAndStartCamera() {
+        if (discoveryStarted) return
+        discoveryStarted = true
         viewModelScope.launch(Dispatchers.Default) {
             val initialReport = halInspector.inspectDevice(null)
             applyHalReport(initialReport)
 
-            // Also probe CameraX ProcessCameraProvider asynchronously for cross-API verification
+            // Defer CameraX ProcessCameraProvider verification slightly so it does not compete with initial Camera2 open
+            delay(1200L)
             runCatching {
                 val future = ProcessCameraProvider.getInstance(appContext)
                 future.addListener({

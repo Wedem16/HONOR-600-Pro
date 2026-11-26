@@ -170,31 +170,70 @@ class GLLutLogRenderer(
             position(0)
         }
 
+    private val isStarted = AtomicBoolean(false)
+    private val glLifecycleLock = Any()
+    private var pendingPreviewSurface: Surface? = null
+    private var pendingPreviewW: Int = 1
+    private var pendingPreviewH: Int = 1
+
     fun start(onReady: (SurfaceTexture) -> Unit) {
         if (isReleased.get()) return
-        onSurfaceTextureReady = onReady
-        if (glThread != null) {
-            glHandler?.post { surfaceTexture?.let(onReady) }
-            return
-        }
-        glThread = HandlerThread("Honor600GLThread").apply { start() }
-        glHandler = Handler(glThread!!.looper)
-        glHandler?.post {
-            initEglAndGl()
-            surfaceTexture?.let { st -> onSurfaceTextureReady?.invoke(st) }
+        synchronized(glLifecycleLock) {
+            onSurfaceTextureReady = onReady
+            if (isStarted.get()) {
+                glHandler?.post {
+                    if (isInitialized.get()) {
+                        surfaceTexture?.let { onReady(it) }
+                    }
+                }
+                return
+            }
+            isStarted.set(true)
+            val thread = HandlerThread("Honor600GLThread").apply { start() }
+            val handler = Handler(thread.looper)
+            glThread = thread
+            glHandler = handler
+            handler.post {
+                initEglAndGl()
+                val queuedSurface: Surface?
+                val queuedW: Int
+                val queuedH: Int
+                synchronized(glLifecycleLock) {
+                    queuedSurface = pendingPreviewSurface
+                    queuedW = pendingPreviewW
+                    queuedH = pendingPreviewH
+                }
+                if (queuedSurface != null && queuedSurface.isValid) {
+                    attachPreviewSurfaceLocked(queuedSurface, queuedW, queuedH)
+                }
+                surfaceTexture?.let { st ->
+                    synchronized(glLifecycleLock) { onSurfaceTextureReady }?.invoke(st)
+                }
+            }
         }
     }
 
     fun setPreviewSurface(surface: Surface?, width: Int, height: Int) {
-        glHandler?.post {
-            destroyPreviewSurfaceLocked()
-            previewWidth = max(1, width)
-            previewHeight = max(1, height)
-            if (surface != null && surface.isValid && eglDisplay != EGL14.EGL_NO_DISPLAY && eglConfig != null) {
-                val attribs = intArrayOf(EGL14.EGL_NONE)
-                previewEglSurface = EGL14.eglCreateWindowSurface(eglDisplay, eglConfig, surface, attribs, 0)
-                updateMvpMatrix()
-            }
+        val handler: Handler?
+        synchronized(glLifecycleLock) {
+            pendingPreviewSurface = surface
+            pendingPreviewW = max(1, width)
+            pendingPreviewH = max(1, height)
+            handler = glHandler
+        }
+        handler?.post {
+            attachPreviewSurfaceLocked(surface, width, height)
+        }
+    }
+
+    private fun attachPreviewSurfaceLocked(surface: Surface?, width: Int, height: Int) {
+        destroyPreviewSurfaceLocked()
+        previewWidth = max(1, width)
+        previewHeight = max(1, height)
+        if (surface != null && surface.isValid && eglDisplay != EGL14.EGL_NO_DISPLAY && eglConfig != null) {
+            val attribs = intArrayOf(EGL14.EGL_NONE)
+            previewEglSurface = EGL14.eglCreateWindowSurface(eglDisplay, eglConfig, surface, attribs, 0)
+            updateMvpMatrix()
         }
     }
 
