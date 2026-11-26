@@ -1,0 +1,33 @@
+<resources>
+    <string name="app_name">HONOR 600 Pro Cam</string>
+    <string name="app_subtitle_fan_made">Fan-made cinema camera — not an official HONOR product</string>
+    <string name="permission_camera_title">Cinema Camera Access</string>
+    <string name="permission_camera_rationale">HONOR 600 Pro Cam requires camera hardware access for live Camera2/CameraX capture, OpenGL ES 3.0 Log and 3D LUT grading, and real-time waveform monitoring. Microphone access is optional for video audio recording.</string>
+    <string name="permission_grant_button">Grant Camera Access</string>
+    <string name="permission_open_settings">Open App Settings</string>
+    <string name="mode_photo">PHOTO</string>
+    <string name="mode_video">VIDEO</string>
+    <string name="mode_cinema">CINEMA</string>
+    <string name="action_capture_photo">Capture Photo</string>
+    <string name="action_start_recording">Start Video Recording</string>
+    <string name="action_stop_recording">Stop Video Recording</string>
+    <string name="action_switch_camera">Switch Camera Lens</string>
+    <string name="action_flash_toggle">Toggle Flash or Torch</string>
+    <string name="action_open_gallery">Open Latest Capture in Gallery</string>
+    <string name="action_open_settings">Camera Settings and Monitoring</string>
+    <string name="action_open_hal_inspector">Open HAL Inspector</string>
+    <string name="action_toggle_clean_mode">Toggle Clean Cinema View</string>
+    <string name="action_open_lut_studio">Open 3D LUT Studio</string>
+    <string name="action_open_log_profiles">Open Log and HDR Profiles</string>
+    <string name="action_import_cube">Import .cube LUT</string>
+    <string name="action_export_cube">Export .cube LUT</string>
+    <string name="action_copy_report">Copy Capability Report</string>
+    <string name="label_hal_inspector">HAL Sensor &amp; Capability Inspector</string>
+    <string name="label_lut_studio">3D LUT Color Studio</string>
+    <string name="label_log_profiles">Log &amp; HDR Transfer Profiles</string>
+    <string name="label_settings">Cinema Settings &amp; Scopes</string>
+    <string name="label_simulated_disclaimer">Simulated / Inspired transfer approximation</string>
+    <string name="label_split_original">ORIGINAL</string>
+    <string name="label_split_graded">GRADED</string>
+    <string name="label_no_camera_detected">No accessible camera hardware detected on this device.</string>
+</resources>

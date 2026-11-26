@@ -1,0 +1,6 @@
+{
+  "name": "HONOR 600 Pro Cam",
+  "description": "Fan-made professional native Android cinema camera application with Camera2/CameraX HAL inspection, 60 FPS video recording, real-time OpenGL ES 3.0 Log & HDR profiles, 3D LUT color grading, and live cinema waveform monitoring.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
